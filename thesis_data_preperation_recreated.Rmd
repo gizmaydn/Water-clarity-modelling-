@@ -1,0 +1,166 @@
+---
+title: "data_preperation_thesis"
+author: "Gizem Aydın"
+date: "2026-10-15"
+output: html_document
+---
+
+```{r}
+
+library(dplyr)
+library(tidyr)
+library(readr)
+
+```
+
+
+
+```{r}
+# some definitions
+
+years <- 1997:2023
+months <- 4:10
+bio_i <- c(1998,1999)
+
+raw  <- "../averages.tsv"
+merged <- "../merged_data.csv"
+fish  <- "../fish_removal_year.csv"
+ss  <- "data/ss_monthly.csv"
+
+z <- function(x) as.numeric(scale(x))
+```
+
+
+
+```{r}
+#monthly grid
+# check the working directory
+
+grid <- expand_grid(Year = years, Month = months) |>
+  left_join(read_csv(merged, show_col_types = FALSE) |>
+              select(Year, Month, mean_temp, mean_depth, total_biomass),
+            by = c("Year", "Month")) |>
+  filter(is.finite(mean_temp), is.finite(mean_depth)) |>
+  arrange(Year, Month) |>
+  mutate(slot = row_number(),
+         yr   = as.integer(factor(Year)))
+
+YEARS <- sort(unique(grid$Year))
+N <- nrow(grid)
+J <- length(years)
+
+temp  <- z(grid$mean_temp)
+depth <- z(grid$mean_depth)
+
+```
+
+```{r}
+# sample level
+
+raw_i <- read_tsv(raw, show_col_types = FALSE) |> rename_with(trimws)
+
+var_patterns <- c(chla = "^Chl", srp = "^SRP", din = "^DIN", sec = "^Secchi")
+col_map <- sapply(var_patterns, function(p) names(raw_i)[grep(p, names(raw_i), ignore.case = TRUE)][1])
+
+raw_long <- raw_i |>
+  mutate(Year = suppressWarnings(as.numeric(Year)),
+         Month = suppressWarnings(as.numeric(Month))) |>
+  inner_join(grid |> select(Year, Month, slot), by = c("Year", "Month")) |>
+  pivot_longer(cols = all_of(unname(col_map)), names_to = "raw_var", values_to = "val") |>
+  mutate(var = names(col_map)[match(raw_var, col_map)],
+         log_val = log10(val)) |>
+  filter(is.finite(log_val))
+
+# observations into list(y, ix, K)
+obs <- lapply(split(raw_long, raw_long$var), function(df) {
+  list(y = df$log_val, ix = as.integer(df$slot), K = nrow(df))
+})
+
+#add monthly observed ss
+ss_df <- read_csv(ss, show_col_types = FALSE) |>
+  inner_join(grid |> select(Year, Month, slot), by = c("Year", "Month")) |>
+  filter(is.finite(SS), SS > 0) |>
+  mutate(log_ss = log10(SS))
+
+obs$ss <- list(y = ss_df$log_ss, ix = as.integer(ss_df$slot), K = nrow(ss_df))
+
+# Grid-aligned SS covariate (with NAs for missing months)
+ss_slot <- rep(NA_real_, N)
+ss_slot[ss_df$slot] <- ss_df$log_ss
+ss_cov  <- z(ss_slot)
+
+# Zooplankton (from monthly grid)
+zoo_df <- grid |>
+  mutate(log_zoo = log10(total_biomass)) |>
+  filter(is.finite(log_zoo))
+
+obs$zoo <- list(y = zoo_df$log_zoo, ix = as.integer(zoo_df$slot), K = nrow(zoo_df))
+
+```
+
+```{r}
+# addition of year level fish intervention
+
+fishI <- (years %in% bio_i) - mean(years %in% bio_i)
+
+dose <- tibble(Year = years) |>
+  left_join(read_csv(fish, show_col_types = FALSE) |>
+              select(Year, removal_kg_growseason), by = "Year") |>
+  replace_na(list(removal_kg_growseason = 0))
+
+fishR <- z(dose$removal_kg_growseason)
+
+```
+
+```{r}
+# put the data in JAGS format
+
+jags_data <- list(
+  N = N, J = J, A = 0L,
+  yr = grid$yr, temp = temp, depth = depth,
+  fishI = fishI, fishR = fishR,
+  
+  # Observation vectors
+  K_chla = obs$chla$K, y_chla = obs$chla$y, ix_chla = obs$chla$ix,
+  K_srp  = obs$srp$K,  y_srp  = obs$srp$y,  ix_srp  = obs$srp$ix,
+  K_din  = obs$din$K,  y_din  = obs$din$y,  ix_din  = obs$din$ix,
+  K_zoo  = obs$zoo$K,  y_zoo  = obs$zoo$y,  ix_zoo  = obs$zoo$ix,
+  K_sec  = obs$sec$K,  y_sec  = obs$sec$y,  ix_sec  = obs$sec$ix,
+  K_ss   = obs$ss$K,   y_ss   = obs$ss$y,   ix_ss   = obs$ss$ix,
+  ss_cov = ss_cov,
+  
+  # Prior centers (means) and scaling factors (SDs)
+  srp_mn  = mean(obs$srp$y),  srp_sd  = sd(obs$srp$y),
+  din_mn  = mean(obs$din$y),  din_sd  = sd(obs$din$y),
+  zoo_mn  = mean(obs$zoo$y),  zoo_sd  = sd(obs$zoo$y),
+  chla_mn = mean(obs$chla$y), chla_sd = sd(obs$chla$y),
+  ss_mn   = mean(obs$ss$y),   ss_sd   = sd(obs$ss$y),
+  sec_mn  = mean(obs$sec$y),
+  
+  # Empty legacy anchor placeholders
+  nm = integer(0), anchor_idx = matrix(0L, nrow = 0, ncol = length(months)), 
+  ss_anchor = numeric(0)
+)
+
+meta <- list(years = years, months = months, grid = grid, bio_I = bio_i)
+```
+
+  
+```{r}
+# save output
+
+DIR_OUT <- "outputs"
+
+# Ensure the output directory exists before saving
+if (!dir.exists(DIR_OUT)) {
+  dir.create(DIR_OUT, recursive = TRUE)
+}
+
+out_file <- file.path(DIR_OUT, "model_data.rds")
+saveRDS(list(jags_data = jags_data, meta = meta), file = out_file)
+
+# sanity check 
+cat(sprintf("Successfully saved JAGS model data to '%s'\n", out_file))
+cat(sprintf("Grid slots (N): %d | Years (J): %d\n", jags_data$N, jags_data$J))
+```
+  
